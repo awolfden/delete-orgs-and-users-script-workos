@@ -1,0 +1,24 @@
+{
+  "name": "delete-orgs-script",
+  "version": "2.0.0",
+  "description": "High-performance script to delete WorkOS organizations and users at scale (60x faster with real-time progress bar)",
+  "type": "module",
+  "main": "delete-orgs.js",
+  "scripts": {
+    "start": "node delete-orgs.js",
+    "help": "node delete-orgs.js --help",
+    "demo": "node test-progress-bar.js"
+  },
+  "keywords": [
+    "workos",
+    "organizations",
+    "delete"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@workos-inc/node": "^7.63.0",
+    "cli-progress": "^3.12.0",
+    "dotenv": "^17.2.3"
+  }
+}

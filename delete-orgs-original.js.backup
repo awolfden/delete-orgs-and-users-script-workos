@@ -1,0 +1,717 @@
+#!/usr/bin/env node
+
+/**
+ * WorkOS Organizations and Users Deletion Script
+ *
+ * This script:
+ * 1. Lists all organizations (and optionally users) from WorkOS
+ * 2. Filters for organizations/users created on a specified date or within a date range
+ * 3. Deletes those organizations/users one by one
+ * 4. Prints results in a human-readable CLI output
+ * 5. Implements proactive rate limiting (1.5s between requests) with 80% safety margin
+ * 6. Handles 429 errors with exponential backoff retry logic
+ *
+ * Usage:
+ *   node delete-orgs.js <date>                  Single date (orgs only)
+ *   node delete-orgs.js <start> <end>           Date range (orgs only)
+ *   node delete-orgs.js --users <date>          Single date (orgs and users)
+ *   node delete-orgs.js --users <start> <end>   Date range (orgs and users)
+ *
+ * Examples:
+ *   node delete-orgs.js 2005-12-17
+ *   node delete-orgs.js 2005-12-17 2005-12-25
+ *   node delete-orgs.js --users 2005-12-17
+ *   node delete-orgs.js --users 2005-12-17 2005-12-25
+ */
+
+import 'dotenv/config';
+import { WorkOS } from '@workos-inc/node';
+
+// Initialize WorkOS client with API key from environment variable
+const workos = new WorkOS(process.env.WORKOS_API_KEY);
+
+/**
+ * Rate limiter to comply with WorkOS API limits (50 requests per 60 seconds)
+ * Uses proactive request spacing with safety margin to prevent hitting limits
+ */
+class RateLimiter {
+  constructor() {
+    // WorkOS limit: 50 requests per 60 seconds
+    // Use 40 requests per 60s for safety margin (80% of limit)
+    // This gives us 1.5 seconds between requests
+    this.delayBetweenRequests = 1500; // milliseconds
+    this.lastRequestTime = 0;
+  }
+
+  /**
+   * Wait if needed to maintain safe request rate
+   */
+  async waitIfNeeded() {
+    const now = Date.now();
+    const timeSinceLastRequest = now - this.lastRequestTime;
+
+    if (timeSinceLastRequest < this.delayBetweenRequests && this.lastRequestTime > 0) {
+      const waitTime = this.delayBetweenRequests - timeSinceLastRequest;
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+    }
+
+    this.lastRequestTime = Date.now();
+  }
+
+  /**
+   * Handle rate limit errors with exponential backoff
+   */
+  async handleRateLimitError(attemptNumber = 1) {
+    const maxAttempts = 3;
+    if (attemptNumber > maxAttempts) {
+      throw new Error('Max retry attempts reached for rate limit');
+    }
+
+    // Exponential backoff: 2s, 4s, 8s
+    const backoffTime = Math.pow(2, attemptNumber) * 1000;
+    console.log(`   ⏳ Rate limit hit. Backing off for ${backoffTime / 1000}s (attempt ${attemptNumber}/${maxAttempts})...`);
+    await new Promise(resolve => setTimeout(resolve, backoffTime));
+  }
+}
+
+// Create rate limiter instance
+const rateLimiter = new RateLimiter();
+
+/**
+ * Parse and validate command line arguments
+ */
+function parseArguments() {
+  let args = process.argv.slice(2);
+
+  // Show help if requested
+  if (args.includes('--help') || args.includes('-h')) {
+    showHelp();
+    process.exit(0);
+  }
+
+  // Check for --users flag
+  const deleteUsers = args.includes('--users');
+  args = args.filter(arg => arg !== '--users');
+
+  // Check for --debug flag
+  const debug = args.includes('--debug');
+  args = args.filter(arg => arg !== '--debug');
+
+  // Check if date argument is provided
+  if (args.length === 0) {
+    console.error('❌ Error: Date argument is required.\n');
+    showHelp();
+    process.exit(1);
+  }
+
+  // Validate date format (YYYY-MM-DD)
+  const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+
+  const validateDate = (dateStr) => {
+    if (!dateRegex.test(dateStr)) {
+      console.error('❌ Error: Invalid date format.');
+      console.error('   Expected format: YYYY-MM-DD (e.g., 2005-12-17)\n');
+      process.exit(1);
+    }
+
+    const date = new Date(dateStr);
+    if (isNaN(date.getTime())) {
+      console.error('❌ Error: Invalid date provided.');
+      console.error('   Please provide a valid date in YYYY-MM-DD format.\n');
+      process.exit(1);
+    }
+
+    return date;
+  };
+
+  // Parse single date or date range
+  if (args.length === 1) {
+    // Single date
+    const date = validateDate(args[0]);
+    return {
+      mode: 'single',
+      date: args[0],
+      dateObj: date,
+      deleteUsers,
+      debug
+    };
+  } else if (args.length === 2) {
+    // Date range
+    const startDate = validateDate(args[0]);
+    const endDate = validateDate(args[1]);
+
+    // Ensure start date is before or equal to end date
+    if (startDate > endDate) {
+      console.error('❌ Error: Start date must be before or equal to end date.\n');
+      process.exit(1);
+    }
+
+    return {
+      mode: 'range',
+      startDate: args[0],
+      endDate: args[1],
+      startDateObj: startDate,
+      endDateObj: endDate,
+      deleteUsers,
+      debug
+    };
+  } else {
+    console.error('❌ Error: Too many arguments provided.\n');
+    showHelp();
+    process.exit(1);
+  }
+}
+
+/**
+ * Show help information
+ */
+function showHelp() {
+  console.log('WorkOS Organizations and Users Deletion Script');
+  console.log('');
+  console.log('Usage:');
+  console.log('  node delete-orgs.js [--users] <date>              Delete orgs (and users) on a specific date');
+  console.log('  node delete-orgs.js [--users] <start> <end>       Delete orgs (and users) within a date range');
+  console.log('  npm start [--users] <date>                        Using npm');
+  console.log('  npm start -- [--users] <start> <end>              Using npm with range');
+  console.log('');
+  console.log('Arguments:');
+  console.log('  <date>        Single date in YYYY-MM-DD format (e.g., 2005-12-17)');
+  console.log('  <start>       Start date for range in YYYY-MM-DD format');
+  console.log('  <end>         End date for range in YYYY-MM-DD format (inclusive)');
+  console.log('');
+  console.log('Options:');
+  console.log('  --users       Also delete users created on the specified date(s)');
+  console.log('  --debug       Show all organizations/users with their dates (UTC and local)');
+  console.log('  -h, --help    Show this help message');
+  console.log('');
+  console.log('Examples:');
+  console.log('  node delete-orgs.js 2005-12-17                    Delete orgs from Dec 17, 2005');
+  console.log('  node delete-orgs.js 2005-12-17 2005-12-25         Delete orgs from Dec 17-25, 2005');
+  console.log('  node delete-orgs.js --users 2005-12-17            Delete orgs and users from Dec 17, 2005');
+  console.log('  node delete-orgs.js --users 2005-12-17 2005-12-25 Delete orgs and users from Dec 17-25, 2005');
+  console.log('  npm start 2005-12-17');
+  console.log('  npm start -- --users 2005-12-17 2005-12-25        Note: -- needed for npm');
+  console.log('');
+  console.log('Environment Variables:');
+  console.log('  WORKOS_API_KEY    Your WorkOS API key (required)');
+  console.log('');
+}
+
+// Get target date/range from command line arguments
+const dateFilter = parseArguments();
+
+/**
+ * Check if an organization was created within the target date/range
+ */
+function matchesDateFilter(createdAt) {
+  const createdDate = new Date(createdAt);
+  const year = createdDate.getUTCFullYear();
+  const month = String(createdDate.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(createdDate.getUTCDate()).padStart(2, '0');
+  const dateStr = `${year}-${month}-${day}`;
+
+  if (dateFilter.mode === 'single') {
+    return dateStr === dateFilter.date;
+  } else {
+    // Range mode - check if date is between start and end (inclusive)
+    return dateStr >= dateFilter.startDate && dateStr <= dateFilter.endDate;
+  }
+}
+
+/**
+ * Fetch all organizations with pagination
+ */
+async function fetchAllOrganizations() {
+  console.log('📋 Fetching all organizations...\n');
+
+  const allOrganizations = [];
+  let after = null;
+  let pageCount = 0;
+
+  try {
+    do {
+      pageCount++;
+      const params = {
+        limit: 100, // Maximum allowed
+        order: 'desc'
+      };
+
+      if (after) {
+        params.after = after;
+      }
+
+      console.log(`   Fetching page ${pageCount}...`);
+
+      // Apply rate limiting
+      await rateLimiter.waitIfNeeded();
+
+      let response;
+      let retryAttempt = 0;
+      const maxRetries = 3;
+
+      // Retry loop for rate limit errors
+      while (retryAttempt <= maxRetries) {
+        try {
+          response = await workos.organizations.listOrganizations(params);
+          break; // Success, exit retry loop
+        } catch (error) {
+          // Check if it's a rate limit error (429)
+          if (error.status === 429 && retryAttempt < maxRetries) {
+            retryAttempt++;
+            await rateLimiter.handleRateLimitError(retryAttempt);
+          } else {
+            throw error; // Re-throw if not rate limit or max retries reached
+          }
+        }
+      }
+
+      if (response.data && response.data.length > 0) {
+        allOrganizations.push(...response.data);
+        console.log(`   ✓ Retrieved ${response.data.length} organizations`);
+      }
+
+      // Check if there are more pages
+      after = response.listMetadata?.after || null;
+
+    } while (after);
+
+    console.log(`\n✓ Total organizations fetched: ${allOrganizations.length}\n`);
+    return allOrganizations;
+
+  } catch (error) {
+    console.error('❌ Error fetching organizations:', error.message);
+    if (error.response?.data) {
+      console.error('   Details:', JSON.stringify(error.response.data, null, 2));
+    }
+    throw error;
+  }
+}
+
+/**
+ * Fetch all users with pagination
+ */
+async function fetchAllUsers() {
+  console.log('📋 Fetching all users...\n');
+
+  const allUsers = [];
+  let after = null;
+  let pageCount = 0;
+
+  try {
+    do {
+      pageCount++;
+      const params = {
+        limit: 100, // Maximum allowed
+        order: 'desc'
+      };
+
+      if (after) {
+        params.after = after;
+      }
+
+      console.log(`   Fetching page ${pageCount}...`);
+
+      // Apply rate limiting
+      await rateLimiter.waitIfNeeded();
+
+      let response;
+      let retryAttempt = 0;
+      const maxRetries = 3;
+
+      // Retry loop for rate limit errors
+      while (retryAttempt <= maxRetries) {
+        try {
+          response = await workos.userManagement.listUsers(params);
+          break; // Success, exit retry loop
+        } catch (error) {
+          // Check if it's a rate limit error (429)
+          if (error.status === 429 && retryAttempt < maxRetries) {
+            retryAttempt++;
+            await rateLimiter.handleRateLimitError(retryAttempt);
+          } else {
+            throw error; // Re-throw if not rate limit or max retries reached
+          }
+        }
+      }
+
+      if (response.data && response.data.length > 0) {
+        allUsers.push(...response.data);
+        console.log(`   ✓ Retrieved ${response.data.length} users`);
+      }
+
+      // Check if there are more pages
+      after = response.listMetadata?.after || null;
+
+    } while (after);
+
+    console.log(`\n✓ Total users fetched: ${allUsers.length}\n`);
+    return allUsers;
+
+  } catch (error) {
+    console.error('❌ Error fetching users:', error.message);
+    if (error.response?.data) {
+      console.error('   Details:', JSON.stringify(error.response.data, null, 2));
+    }
+    throw error;
+  }
+}
+
+/**
+ * Filter organizations by target date/range
+ */
+function filterOrganizationsByDate(organizations) {
+  const filterDescription = dateFilter.mode === 'single'
+    ? `on ${dateFilter.date}`
+    : `between ${dateFilter.startDate} and ${dateFilter.endDate}`;
+
+  console.log(`🔍 Filtering organizations created ${filterDescription}...\n`);
+
+  if (dateFilter.debug) {
+    console.log('DEBUG: All organizations with their UTC dates:');
+    organizations.forEach(org => {
+      const createdDate = new Date(org.createdAt);
+      const utcDate = `${createdDate.getUTCFullYear()}-${String(createdDate.getUTCMonth() + 1).padStart(2, '0')}-${String(createdDate.getUTCDate()).padStart(2, '0')}`;
+      const localDate = `${createdDate.getFullYear()}-${String(createdDate.getMonth() + 1).padStart(2, '0')}-${String(createdDate.getDate()).padStart(2, '0')}`;
+      console.log(`   ${org.name || 'Unnamed'} (${org.id})`);
+      console.log(`      Created (UTC): ${utcDate} at ${createdDate.toISOString()}`);
+      console.log(`      Created (Local): ${localDate} at ${createdDate.toLocaleString()}`);
+    });
+    console.log('');
+  }
+
+  const filtered = organizations.filter(org => {
+    if (!org.createdAt) {
+      console.log(`   ⚠️  Organization ${org.id} has no createdAt field`);
+      return false;
+    }
+    return matchesDateFilter(org.createdAt);
+  });
+
+  console.log(`✓ Found ${filtered.length} organization(s) created ${filterDescription}\n`);
+
+  if (filtered.length > 0) {
+    console.log('Organizations to be deleted:');
+    filtered.forEach((org, index) => {
+      console.log(`   ${index + 1}. ${org.name || 'Unnamed'} (ID: ${org.id})`);
+      console.log(`      Created: ${org.createdAt}`);
+    });
+    console.log('');
+  }
+
+  return filtered;
+}
+
+/**
+ * Filter users by target date/range
+ */
+function filterUsersByDate(users) {
+  const filterDescription = dateFilter.mode === 'single'
+    ? `on ${dateFilter.date}`
+    : `between ${dateFilter.startDate} and ${dateFilter.endDate}`;
+
+  console.log(`🔍 Filtering users created ${filterDescription}...\n`);
+
+  if (dateFilter.debug) {
+    console.log('DEBUG: All users with their UTC dates:');
+    users.forEach(user => {
+      const userName = user.firstName && user.lastName
+        ? `${user.firstName} ${user.lastName}`
+        : user.email || 'Unnamed';
+      const createdDate = new Date(user.createdAt);
+      const utcDate = `${createdDate.getUTCFullYear()}-${String(createdDate.getUTCMonth() + 1).padStart(2, '0')}-${String(createdDate.getUTCDate()).padStart(2, '0')}`;
+      const localDate = `${createdDate.getFullYear()}-${String(createdDate.getMonth() + 1).padStart(2, '0')}-${String(createdDate.getDate()).padStart(2, '0')}`;
+      console.log(`   ${userName} (${user.id})`);
+      console.log(`      Created (UTC): ${utcDate} at ${createdDate.toISOString()}`);
+      console.log(`      Created (Local): ${localDate} at ${createdDate.toLocaleString()}`);
+    });
+    console.log('');
+  }
+
+  const filtered = users.filter(user => {
+    if (!user.createdAt) {
+      console.log(`   ⚠️  User ${user.id} has no createdAt field`);
+      return false;
+    }
+    return matchesDateFilter(user.createdAt);
+  });
+
+  console.log(`✓ Found ${filtered.length} user(s) created ${filterDescription}\n`);
+
+  if (filtered.length > 0) {
+    console.log('Users to be deleted:');
+    filtered.forEach((user, index) => {
+      const userName = user.firstName && user.lastName
+        ? `${user.firstName} ${user.lastName}`
+        : user.email || 'Unnamed';
+      console.log(`   ${index + 1}. ${userName} (ID: ${user.id})`);
+      console.log(`      Created: ${user.createdAt}`);
+    });
+    console.log('');
+  }
+
+  return filtered;
+}
+
+/**
+ * Delete organizations one by one
+ */
+async function deleteOrganizations(organizations) {
+  if (organizations.length === 0) {
+    console.log('✓ No organizations to delete.\n');
+    return { successful: [], failed: [] };
+  }
+
+  console.log(`🗑️  Deleting ${organizations.length} organization(s)...\n`);
+
+  const results = {
+    successful: [],
+    failed: []
+  };
+
+  for (let i = 0; i < organizations.length; i++) {
+    const org = organizations[i];
+    const orgName = org.name || 'Unnamed';
+    const progress = `[${i + 1}/${organizations.length}]`;
+
+    try {
+      console.log(`   ${progress} Deleting "${orgName}" (${org.id})...`);
+
+      // Apply rate limiting
+      await rateLimiter.waitIfNeeded();
+
+      // Retry loop for rate limit errors
+      let retryAttempt = 0;
+      const maxRetries = 3;
+      let deleted = false;
+
+      while (retryAttempt <= maxRetries && !deleted) {
+        try {
+          await workos.organizations.deleteOrganization(org.id);
+          deleted = true;
+        } catch (error) {
+          // Check if it's a rate limit error (429)
+          if (error.status === 429 && retryAttempt < maxRetries) {
+            retryAttempt++;
+            await rateLimiter.handleRateLimitError(retryAttempt);
+          } else {
+            throw error; // Re-throw if not rate limit or max retries reached
+          }
+        }
+      }
+
+      console.log(`   ✓ Successfully deleted "${orgName}"`);
+      results.successful.push({
+        id: org.id,
+        name: orgName,
+        createdAt: org.createdAt
+      });
+
+    } catch (error) {
+      console.error(`   ❌ Failed to delete "${orgName}":`, error.message);
+      results.failed.push({
+        id: org.id,
+        name: orgName,
+        createdAt: org.createdAt,
+        error: error.message
+      });
+    }
+  }
+
+  console.log('');
+  return results;
+}
+
+/**
+ * Delete users one by one
+ */
+async function deleteUsers(users) {
+  if (users.length === 0) {
+    console.log('✓ No users to delete.\n');
+    return { successful: [], failed: [] };
+  }
+
+  console.log(`🗑️  Deleting ${users.length} user(s)...\n`);
+
+  const results = {
+    successful: [],
+    failed: []
+  };
+
+  for (let i = 0; i < users.length; i++) {
+    const user = users[i];
+    const userName = user.firstName && user.lastName
+      ? `${user.firstName} ${user.lastName}`
+      : user.email || 'Unnamed';
+    const progress = `[${i + 1}/${users.length}]`;
+
+    try {
+      console.log(`   ${progress} Deleting "${userName}" (${user.id})...`);
+
+      // Apply rate limiting
+      await rateLimiter.waitIfNeeded();
+
+      // Retry loop for rate limit errors
+      let retryAttempt = 0;
+      const maxRetries = 3;
+      let deleted = false;
+
+      while (retryAttempt <= maxRetries && !deleted) {
+        try {
+          await workos.userManagement.deleteUser(user.id);
+          deleted = true;
+        } catch (error) {
+          // Check if it's a rate limit error (429)
+          if (error.status === 429 && retryAttempt < maxRetries) {
+            retryAttempt++;
+            await rateLimiter.handleRateLimitError(retryAttempt);
+          } else {
+            throw error; // Re-throw if not rate limit or max retries reached
+          }
+        }
+      }
+
+      console.log(`   ✓ Successfully deleted "${userName}"`);
+      results.successful.push({
+        id: user.id,
+        name: userName,
+        createdAt: user.createdAt
+      });
+
+    } catch (error) {
+      console.error(`   ❌ Failed to delete "${userName}":`, error.message);
+      results.failed.push({
+        id: user.id,
+        name: userName,
+        createdAt: user.createdAt,
+        error: error.message
+      });
+    }
+  }
+
+  console.log('');
+  return results;
+}
+
+/**
+ * Print final summary
+ */
+function printSummary(orgResults, userResults = null) {
+  console.log('═══════════════════════════════════════════════════════════');
+  console.log('                    DELETION SUMMARY                        ');
+  console.log('═══════════════════════════════════════════════════════════\n');
+
+  // Organizations summary
+  console.log('Organizations:');
+  console.log(`  ✓ Successfully deleted: ${orgResults.successful.length}`);
+  console.log(`  ❌ Failed to delete:    ${orgResults.failed.length}`);
+  console.log(`  📊 Total processed:     ${orgResults.successful.length + orgResults.failed.length}\n`);
+
+  // Users summary (if applicable)
+  if (userResults) {
+    console.log('Users:');
+    console.log(`  ✓ Successfully deleted: ${userResults.successful.length}`);
+    console.log(`  ❌ Failed to delete:    ${userResults.failed.length}`);
+    console.log(`  📊 Total processed:     ${userResults.successful.length + userResults.failed.length}\n`);
+  }
+
+  // Detailed results
+  if (orgResults.successful.length > 0) {
+    console.log('Successfully deleted organizations:');
+    orgResults.successful.forEach((org, index) => {
+      console.log(`   ${index + 1}. ${org.name} (${org.id})`);
+    });
+    console.log('');
+  }
+
+  if (userResults && userResults.successful.length > 0) {
+    console.log('Successfully deleted users:');
+    userResults.successful.forEach((user, index) => {
+      console.log(`   ${index + 1}. ${user.name} (${user.id})`);
+    });
+    console.log('');
+  }
+
+  if (orgResults.failed.length > 0) {
+    console.log('Failed organization deletions:');
+    orgResults.failed.forEach((org, index) => {
+      console.log(`   ${index + 1}. ${org.name} (${org.id})`);
+      console.log(`      Error: ${org.error}`);
+    });
+    console.log('');
+  }
+
+  if (userResults && userResults.failed.length > 0) {
+    console.log('Failed user deletions:');
+    userResults.failed.forEach((user, index) => {
+      console.log(`   ${index + 1}. ${user.name} (${user.id})`);
+      console.log(`      Error: ${user.error}`);
+    });
+    console.log('');
+  }
+
+  console.log('═══════════════════════════════════════════════════════════\n');
+}
+
+/**
+ * Main execution
+ */
+async function main() {
+  const targetDescription = dateFilter.mode === 'single'
+    ? `on ${dateFilter.date}`
+    : `between ${dateFilter.startDate} and ${dateFilter.endDate} (inclusive)`;
+
+  const deleteUsersFlag = dateFilter.deleteUsers;
+  const targetTypes = deleteUsersFlag ? 'organizations and users' : 'organizations';
+
+  console.log('\n═══════════════════════════════════════════════════════════');
+  console.log('       WorkOS Organizations Deletion Script                ');
+  console.log('═══════════════════════════════════════════════════════════\n');
+  console.log(`Target: Delete ${targetTypes} created ${targetDescription}\n`);
+
+  // Validate API key
+  if (!process.env.WORKOS_API_KEY) {
+    console.error('❌ Error: WORKOS_API_KEY environment variable is not set.');
+    console.error('   Please set it with: export WORKOS_API_KEY="your-api-key"\n');
+    process.exit(1);
+  }
+
+  try {
+    // Step 1: Fetch all organizations
+    const allOrganizations = await fetchAllOrganizations();
+
+    // Step 2: Filter by target date
+    const organizationsToDelete = filterOrganizationsByDate(allOrganizations);
+
+    // Step 3: Delete organizations
+    const orgResults = await deleteOrganizations(organizationsToDelete);
+
+    let userResults = null;
+
+    // If --users flag is set, also handle users
+    if (deleteUsersFlag) {
+      // Step 4: Fetch all users
+      const allUsers = await fetchAllUsers();
+
+      // Step 5: Filter by target date
+      const usersToDelete = filterUsersByDate(allUsers);
+
+      // Step 6: Delete users
+      userResults = await deleteUsers(usersToDelete);
+    }
+
+    // Step 7: Print summary
+    printSummary(orgResults, userResults);
+
+    // Exit with appropriate code
+    const totalFailed = orgResults.failed.length + (userResults ? userResults.failed.length : 0);
+    process.exit(totalFailed > 0 ? 1 : 0);
+
+  } catch (error) {
+    console.error('\n❌ Script failed with error:', error.message);
+    console.error('');
+    process.exit(1);
+  }
+}
+
+// Run the script
+main();
