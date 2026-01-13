@@ -6,8 +6,7 @@
   "main": "delete-orgs.js",
   "scripts": {
     "start": "node delete-orgs.js",
-    "help": "node delete-orgs.js --help",
-    "demo": "node test-progress-bar.js"
+    "help": "node delete-orgs.js --help"
   },
   "keywords": [
     "workos",

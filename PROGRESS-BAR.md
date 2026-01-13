@@ -134,16 +134,6 @@ When using `--users` flag, you'll see separate progress bars for organizations a
    Deleting users |████████████░░░░░░░░░░░░░░░░| 45.2% | 452/1000 | ✓ 450 ❌ 2 | 38.7/s | ETA: 14s
 ```
 
-## Demo
-
-You can see the progress bar in action without making any API calls:
-
-```bash
-npm run demo
-```
-
-This simulates deleting 200 organizations with realistic timing and shows exactly what the progress bar looks like during execution.
-
 ## Benefits
 
 The visual progress bar provides:
