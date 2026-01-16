@@ -4,20 +4,20 @@
  * WorkOS Bulk Deletion Script
  *
  * High-performance script for deleting WorkOS organizations and users at scale.
- * Fully optimized for WorkOS API rate limit: 50 requests per second.
+ * Optimized for WorkOS API rate limits:
+ *   - Organizations: 50 requests per 60 seconds (~0.833 req/s)
+ *   - User Management: 40 requests per second
  *
  * Features:
- * - Concurrent deletions (default: 40 parallel operations)
- * - Token bucket rate limiter (40 req/s default, 80% safety margin)
+ * - Concurrent deletions with separate limits for orgs (5) and users (40)
+ * - Token bucket rate limiters (separate for orgs and users)
  * - Real-time visual progress bar with live metrics
- * - Throughput: ~2,400 deletions per minute
  * - Dry run mode for safe testing
  * - Debug mode for troubleshooting
  *
  * Performance:
- * - 1,000 deletions: ~25 seconds
- * - 10,000 deletions: ~4 minutes
- * - 100,000 deletions: ~42 minutes
+ * - Organizations: ~50 deletions per minute
+ * - Users: ~2,400 deletions per minute
  *
  * Usage:
  *   node delete-orgs.js <date>                  Single date (orgs only)
@@ -28,8 +28,8 @@
  *
  * Environment Variables:
  *   WORKOS_API_KEY           Your WorkOS API key (required)
- *   CONCURRENCY              Max concurrent deletions (default: 40)
- *   MAX_REQUESTS_PER_SECOND  Max requests per second (default: 40, limit: 50)
+ *   CONCURRENCY              Max concurrent user deletions (default: 40)
+ *   MAX_REQUESTS_PER_SECOND  Max requests per second for user management (default: 40)
  */
 
 import 'dotenv/config';
@@ -39,18 +39,22 @@ import cliProgress from 'cli-progress';
 // Initialize WorkOS client with API key from environment variable
 const workos = new WorkOS(process.env.WORKOS_API_KEY);
 
-// Configuration - optimized for 50 req/s API limit
-const CONCURRENCY_LIMIT = parseInt(process.env.CONCURRENCY) || 40;
-const MAX_REQUESTS_PER_SECOND = parseInt(process.env.MAX_REQUESTS_PER_SECOND) || 40;
+// Configuration - different rate limits for different endpoints
+const USER_CONCURRENCY_LIMIT = parseInt(process.env.CONCURRENCY) || 40;
+const ORG_CONCURRENCY_LIMIT = 5; // Lower concurrency for orgs due to strict rate limit
+const MAX_REQUESTS_PER_SECOND = parseInt(process.env.MAX_REQUESTS_PER_SECOND) || 40; // For user management
+const ORG_REQUESTS_PER_MINUTE = 50; // Organizations delete endpoint: 50 requests per 60 seconds
+const ORG_REQUESTS_PER_SECOND = ORG_REQUESTS_PER_MINUTE / 60; // ~0.833 requests per second
 
 /**
- * Token Bucket Rate Limiter - optimized for high throughput (50 req/s)
- * Uses 80% of capacity by default (40 req/s) for safety margin
+ * Token Bucket Rate Limiter
+ * Supports different rate limits for different API endpoints
  */
 class TokenBucketRateLimiter {
-  constructor(maxRequestsPerSecond = 40) {
-    this.capacity = maxRequestsPerSecond;
-    this.tokens = maxRequestsPerSecond;
+  constructor(maxRequestsPerSecond) {
+    // Ensure capacity is at least 1 to allow token acquisition
+    this.capacity = Math.max(1, maxRequestsPerSecond);
+    this.tokens = this.capacity;
     this.refillRate = maxRequestsPerSecond; // tokens per second
     this.lastRefill = Date.now();
   }
@@ -92,8 +96,9 @@ class TokenBucketRateLimiter {
   }
 }
 
-// Create rate limiter instance
-const rateLimiter = new TokenBucketRateLimiter(MAX_REQUESTS_PER_SECOND);
+// Create separate rate limiters for different endpoints
+const orgRateLimiter = new TokenBucketRateLimiter(ORG_REQUESTS_PER_SECOND); // 50 req/60s for organizations
+const userRateLimiter = new TokenBucketRateLimiter(MAX_REQUESTS_PER_SECOND); // 40 req/s for user management
 
 /**
  * Parse and validate command line arguments
@@ -189,8 +194,9 @@ function parseArguments() {
 function showHelp() {
   console.log('WorkOS Bulk Deletion Script');
   console.log('');
-  console.log('High-performance deletion optimized for 50 requests per second');
-  console.log('Default throughput: ~2,400 deletions per minute');
+  console.log('Optimized for WorkOS API rate limits:');
+  console.log('  - Organizations: 50 requests per 60 seconds (~50/min) with 5 concurrent operations');
+  console.log('  - User Management: 40 requests per second (~2,400/min) with 40 concurrent operations');
   console.log('');
   console.log('Usage:');
   console.log('  node delete-orgs.js [options] <date>');
@@ -209,20 +215,24 @@ function showHelp() {
   console.log('');
   console.log('Environment Variables:');
   console.log('  WORKOS_API_KEY              Your WorkOS API key (required)');
-  console.log('  CONCURRENCY                 Max concurrent deletions (default: 40)');
-  console.log('  MAX_REQUESTS_PER_SECOND     Max API requests per second (default: 40, limit: 50)');
+  console.log('  CONCURRENCY                 Max concurrent user deletions (default: 40)');
+  console.log('  MAX_REQUESTS_PER_SECOND     Max requests per second for user management (default: 40)');
   console.log('');
   console.log('Examples:');
   console.log('  node delete-orgs.js 2005-12-17');
   console.log('  node delete-orgs.js --users 2005-12-17 2005-12-25');
   console.log('  node delete-orgs.js --dry-run 2005-12-17');
-  console.log('  CONCURRENCY=50 node delete-orgs.js 2005-12-17');
+  console.log('  CONCURRENCY=50 node delete-orgs.js --users 2005-12-17');
   console.log('');
   console.log('Performance:');
-  console.log('  - Default settings: ~2400 deletions/minute');
-  console.log('  - 1,000 deletions: ~25 seconds');
-  console.log('  - 10,000 deletions: ~4 minutes');
-  console.log('  - 100,000 deletions: ~40 minutes');
+  console.log('  Organizations:');
+  console.log('    - 50 deletions: ~60 seconds');
+  console.log('    - 500 deletions: ~10 minutes');
+  console.log('    - 1,000 deletions: ~20 minutes');
+  console.log('  Users:');
+  console.log('    - 1,000 deletions: ~25 seconds');
+  console.log('    - 10,000 deletions: ~4 minutes');
+  console.log('    - 100,000 deletions: ~42 minutes');
   console.log('');
 }
 
@@ -249,7 +259,7 @@ function matchesDateFilter(createdAt) {
 /**
  * Execute API call with rate limiting and retry logic
  */
-async function executeWithRateLimit(apiCall, maxRetries = 3) {
+async function executeWithRateLimit(apiCall, rateLimiter, maxRetries = 3) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       await rateLimiter.acquireToken();
@@ -297,7 +307,8 @@ async function fetchAllOrganizations() {
       }
 
       const response = await executeWithRateLimit(() =>
-        workos.organizations.listOrganizations(params)
+        workos.organizations.listOrganizations(params),
+        userRateLimiter
       );
 
       if (response.data && response.data.length > 0) {
@@ -349,7 +360,8 @@ async function fetchAllUsers() {
       }
 
       const response = await executeWithRateLimit(() =>
-        workos.userManagement.listUsers(params)
+        workos.userManagement.listUsers(params),
+        userRateLimiter
       );
 
       if (response.data && response.data.length > 0) {
@@ -475,7 +487,7 @@ class ProgressTracker {
 /**
  * Delete multiple entities concurrently with controlled concurrency
  */
-async function deleteEntitiesConcurrently(entities, deleteFunction, entityType) {
+async function deleteEntitiesConcurrently(entities, deleteFunction, entityType, rateLimiter, requestsPerSecond, concurrencyLimit) {
   if (entities.length === 0) {
     console.log(`✓ No ${entityType}s to delete.\n`);
     return { successful: [], failed: [] };
@@ -493,10 +505,10 @@ async function deleteEntitiesConcurrently(entities, deleteFunction, entityType) 
     };
   }
 
-  const estimatedTime = Math.ceil(entities.length / MAX_REQUESTS_PER_SECOND);
+  const estimatedTime = Math.ceil(entities.length / requestsPerSecond);
   console.log(`🗑️  Deleting ${entities.length} ${entityType}(s)...`);
-  console.log(`   Concurrency: ${CONCURRENCY_LIMIT} parallel operations`);
-  console.log(`   Rate limit: ${MAX_REQUESTS_PER_SECOND} req/s`);
+  console.log(`   Concurrency: ${concurrencyLimit} parallel operations`);
+  console.log(`   Rate limit: ${requestsPerSecond.toFixed(2)} req/s`);
   console.log(`   Estimated time: ~${estimatedTime}s\n`);
 
   const results = {
@@ -511,7 +523,7 @@ async function deleteEntitiesConcurrently(entities, deleteFunction, entityType) 
 
   for (const entity of entities) {
     // Wait if we've hit the concurrency limit
-    if (processingQueue.length >= CONCURRENCY_LIMIT) {
+    if (processingQueue.length >= concurrencyLimit) {
       await Promise.race(processingQueue);
     }
 
@@ -522,7 +534,7 @@ async function deleteEntitiesConcurrently(entities, deleteFunction, entityType) 
         : (entity.firstName && entity.lastName ? `${entity.firstName} ${entity.lastName}` : entity.email || 'Unnamed');
 
       try {
-        await executeWithRateLimit(() => deleteFunction(entity.id));
+        await executeWithRateLimit(() => deleteFunction(entity.id), rateLimiter);
 
         results.successful.push({
           id: entity.id,
@@ -635,9 +647,16 @@ async function main() {
   console.log('            WorkOS Bulk Deletion Script                   ');
   console.log('═══════════════════════════════════════════════════════════\n');
   console.log(`Target: Delete ${targetTypes} created ${targetDescription}`);
-  console.log(`Concurrency: ${CONCURRENCY_LIMIT} parallel operations`);
-  console.log(`Rate limit: ${MAX_REQUESTS_PER_SECOND} requests/second (API limit: 50/s)`);
-  console.log(`Throughput: ~${Math.floor(MAX_REQUESTS_PER_SECOND * 60)} deletions/minute`);
+  console.log(`Concurrency:`);
+  console.log(`  - Organizations: ${ORG_CONCURRENCY_LIMIT} parallel operations`);
+  if (deleteUsersFlag) {
+    console.log(`  - Users: ${USER_CONCURRENCY_LIMIT} parallel operations`);
+  }
+  console.log(`Rate limits:`);
+  console.log(`  - Organizations: ${ORG_REQUESTS_PER_MINUTE} requests per 60 seconds (~${Math.floor(ORG_REQUESTS_PER_MINUTE)} deletions/min)`);
+  if (deleteUsersFlag) {
+    console.log(`  - Users: ${MAX_REQUESTS_PER_SECOND} requests/second (~${Math.floor(MAX_REQUESTS_PER_SECOND * 60)} deletions/min)`);
+  }
   if (dateFilter.dryRun) {
     console.log('Mode: DRY RUN (no actual deletions)');
   }
@@ -659,7 +678,10 @@ async function main() {
     const orgResults = await deleteEntitiesConcurrently(
       organizationsToDelete,
       (id) => workos.organizations.deleteOrganization(id),
-      'organization'
+      'organization',
+      orgRateLimiter,
+      ORG_REQUESTS_PER_SECOND,
+      ORG_CONCURRENCY_LIMIT
     );
 
     let userResults = null;
@@ -671,7 +693,10 @@ async function main() {
       userResults = await deleteEntitiesConcurrently(
         usersToDelete,
         (id) => workos.userManagement.deleteUser(id),
-        'user'
+        'user',
+        userRateLimiter,
+        MAX_REQUESTS_PER_SECOND,
+        USER_CONCURRENCY_LIMIT
       );
     }
 
